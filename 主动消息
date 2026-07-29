@@ -1,0 +1,238 @@
+三个实施要点:
+
+1. 选择要有依据,不能靠感觉。 让 Decision Agent 在生成时就标一个 verbatim_sensitive(这段内容转述后是否失真),它是唯一知道自己写了什么、为什么写的角色。配合字符数,给模型一个软性默认:短句直接复述,长且 verbatim_sensitive 的倾向指路。最终仍由模型定。
+
+2. 链接不要让模型拼。 让它输出带 token 的 URL 必然出现字符错漏。改成每个 conv_key 一个固定的 Inbox 链接,Gateway 把完整 URL 作为不透明字符串放进 system prompt,要求原样复制。链接恒定,还能长期记忆。
+
+3. 指路时不能全文转述。 否则两种模式的坏处叠加。只给一个钩子(不超过一句),把内容留在 Inbox 里。
+
+以下是完整替换版 prompt。
+# 任务:为 Kelivo AI 主动消息系统实现 wake-up 闭环
+
+## 背景
+
+现有系统(已实现,不要重写):
+- Heartbeat 定时触发(白天 30min / 夜间 60min)
+- Decision Agent(LLM 决策是否主动联系用户)
+- Gateway(Python, 8788 端口):代理 AI API、注入 Kelivo 人设、保存消息到 SQLite、跨窗口记忆检索
+- ntfy 推送通知
+- Kelivo 是 Flutter 客户端,请求-响应模式,**本地独立 SQLite**,不可修改(已放弃 fork)
+
+核心问题:AI 主动生成的消息存在服务器 SQLite,Kelivo 不知道它存在。
+
+最终目标:AI 自主判断 → 主动产生行为 → 用户看到 → 用户回复 → AI 知道之前发生过什么。
+
+## 架构决策(已确认,按此执行,勿自行更改)
+
+1. **Inbox 是主动消息的唯一完整展示入口**。Kelivo 会话内不承载 wake-up 原文。
+2. **上下文注入解决"AI 知道自己说过什么",Inbox + ntfy 解决"用户看到"**。两者独立,不要混淆。
+3. wake-up 独立存表,**不混入聊天历史表**。
+4. 频率控制交给 Decision Agent 的 LLM 判断,Gateway 只提供信号字段,**不写硬编码每日上限**。
+5. 面对未读 wake-up,AI 有两种承接方式(复述 / 指向 Inbox),由模型自行选择,Gateway 提供判断依据。
+
+## 1. 数据结构
+
+```sql
+CREATE TABLE IF NOT EXISTS wakeup_messages (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  conv_key            TEXT    NOT NULL,
+  content             TEXT    NOT NULL,
+  decision_type       TEXT    NOT NULL,   -- CASUAL_CHAT / FOLLOW_UP / REMINDER
+  reason              TEXT,               -- Decision Agent 的判断理由
+  verbatim_sensitive  INTEGER NOT NULL DEFAULT 0,  -- 1 = 转述会失真,倾向引导用户看原文
+  created_at          INTEGER NOT NULL,
+  notified_at         INTEGER,            -- ntfy 推送成功时间(不代表用户看到)
+  read_at             INTEGER,            -- 用户在 Inbox 实际点开时间
+  consumed_at         INTEGER,            -- 已读消息被注入过上下文的时间
+  surfaced_count      INTEGER NOT NULL DEFAULT 0   -- 未读消息已被送入上下文的次数
+);
+
+CREATE INDEX IF NOT EXISTS idx_wakeup_conv_unread
+  ON wakeup_messages(conv_key, read_at, created_at);
+
+CREATE TABLE IF NOT EXISTS conv_inbox_tokens (
+  conv_key   TEXT PRIMARY KEY,
+  token      TEXT NOT NULL UNIQUE,        -- secrets.token_urlsafe(32)
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS decision_logs (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at    INTEGER NOT NULL,
+  conv_key      TEXT,
+  action        TEXT    NOT NULL,         -- SEND / SKIP
+  decision_type TEXT,
+  reason        TEXT,
+  suppressed_by TEXT,                     -- recent_user_activity / unread_backlog / null
+  raw_json      TEXT
+);
+```
+
+**四态语义必须严格区分,不要合并成单个 `is_read` 布尔值:**
+- `notified_at` = ntfy 推送成功,**不代表用户看到**
+- `read_at` = 用户确认阅读(唯一可信的"已看到"依据)
+
+这个区分直接决定注入行为。模型无法从 `messages[]` 推断用户是否读过,必须由数据库提供事实。
+
+**Inbox token 是 conv 级别、长期固定的**,不要做成 per-message。原因见第 5 节。
+
+## 2. Decision Agent 输出结构
+
+```json
+{
+  "action": "SEND",
+  "type": "CASUAL_CHAT",
+  "reason": "用户最近提到工作压力大,已两天未交流",
+  "verbatim_sensitive": false,
+  "message_draft": "今天怎么样?"
+}
+```
+
+```json
+{
+  "action": "SKIP",
+  "type": null,
+  "reason": "用户 40 分钟前刚结束对话",
+  "suppressed_by": "recent_user_activity",
+  "verbatim_sensitive": false,
+  "message_draft": null
+}
+```
+
+要点:
+- `message_draft` 只是意图草稿。**最终措辞由 Gateway 用完整人设 + 记忆检索重新生成**。不要在 Decision Agent 里做人设注入,避免人设逻辑两处维护导致漂移。
+- `verbatim_sensitive`:判断"这段内容被转述后是否会失去意义"。情感表达、长篇心里话、有具体措辞的内容 → 1;简短问候、事务性提醒 → 0。这是后续注入策略的关键输入。
+- `action == SKIP` 也必须写入 `decision_logs`。否则无法排查"为什么它一整天没联系我"。
+
+Decision Agent 输入 prompt 须包含以下信号(Gateway 计算后传入):
+- `last_user_message_at` 及距今分钟数
+- `consecutive_unread_count`:最近连续 `read_at IS NULL` 的条数
+- `pending_unread_count`
+- 长期记忆中的用户主动性偏好(如"少主动一点")
+
+抑制策略写进 prompt 交给 LLM 判断,**不要写成 Python 硬 if**:
+- `last_user_message_at` 距今 < 90 分钟 → 不应发送(刚聊完,避免打扰)
+- `consecutive_unread_count >= 2` → 禁止 CASUAL_CHAT,仅允许有硬时间约束的 REMINDER
+- `consecutive_unread_count >= 4` → 全部抑制,等用户回来
+- 长期记忆中的用户偏好优先级高于以上默认值
+
+## 3. 会话对齐(conv_key)
+
+Kelivo 只发裸 `messages[]`,Gateway 需要判断归属哪个会话。
+
+- 优先:读取自定义请求头 `X-Conv-Id`(需在 Kelivo 的 provider 配置中添加 header)
+- 兜底:`messages[0]` 内容 hash
+
+兜底方案在用户编辑首条消息时会断链,实现时写注释说明,并优先引导使用 header。
+
+## 4. Gateway 修改位置
+
+### 4-A. Heartbeat / Decision 流程末端
+
+- 解析 Decision Agent JSON
+- `SEND`:用完整人设 + 记忆检索生成最终文案 → 写入 `wakeup_messages`(含 `verbatim_sensitive`)→ 推送 ntfy → 成功后回填 `notified_at`
+- `SKIP`:仅写 `decision_logs`
+- ntfy click action 指向 `/inbox?token=<conv_inbox_token>`
+
+### 4-B. 聊天代理入口(转发上游之前)
+
+按 `conv_key` 查询待处理 wake-up,**按状态分流**:
+
+| 条件 | 注入方式 | 写回 |
+|---|---|---|
+| `read_at` 有值 且 `consumed_at` 为空 | 作为 `assistant` role 消息插入 `messages[]`(带时间锚点)+ system 已读说明 | 请求成功后回填 `consumed_at` |
+| `read_at` IS NULL 且 48h 内 且 `surfaced_count < 2` | **不注入 assistant**,仅 system 未读说明(含双模式选择依据) | 请求成功后 `surfaced_count += 1`,**不回填 `consumed_at`** |
+| 超 48h 未读 或 `surfaced_count >= 2` | 不进上下文,仅计入抑制信号 | 无 |
+
+**未读消息必须允许多轮注入。** 若注入一次即标记 consumed,当模型该轮选择不提起时,这条消息将永久丢失(用户未读 + AI 未说 + 已标记消费)。这是必须避免的数据丢失路径。
+
+`surfaced_count` 上限确实生效,否则会变成每轮复读同一条消息。
+
+### 4-C. system prompt 注入文案
+
+**取消**响应流开头的机械面包屑。由模型用自然语言承接。
+
+**已读分支:**
+
+```
+你在 {时间} 主动给用户发过一条消息:
+「{content}」
+用户已看到该消息。现在是 {当前时间}(约 {间隔} 后)用户才回复。
+你可以自然地承接这个话题,但不要说"刚刚"、"刚才",不要重复问候。
+是否明确提起由你判断,不必刻意。
+```
+
+**未读分支(双模式):**
+
+```
+你在 {时间} 主动给用户发过一条消息:
+「{content}」
+用户尚未确认阅读。你不能假设他知道这件事。
+禁止说"我之前问过你"、"你没回我"、"你没看到吗"之类暗示用户忽略你的话。
+
+如果此刻适合提起这个话题,你有两种方式,自行选择:
+
+(1) 直接说出来 —— 像第一次提起那样自然表达。适合内容简短、
+    转述不损失含义的情况。
+
+(2) 引导用户去看原文 —— 用你自己的话邀请他去看,并原样附上这个链接:
+    {inbox_url}
+    只给一句钩子,不要把原文内容复述出来,否则等于两种方式的缺点叠加。
+    适合内容较长、有情绪或具体措辞、转述后会失真的情况。
+
+参考依据(不是硬规则):
+- 内容长度:{字符数} 字
+- 转述失真风险:{verbatim_sensitive 的高/低}
+- 类型:{decision_type}
+
+如果当前对话氛围不适合,就先不提,以后还有机会。
+
+约束:
+- 链接必须原样复制,不要改写、缩短或补全任何字符
+- 不要把它说成"系统通知"、"未读消息"、"收件箱提醒"这类机械说法,
+  用符合你人设的自然语言
+- 除用户主动问起,不要谈论推送机制、未读状态或消息同步的实现
+```
+
+设计意图(供实现者理解,不要写进 prompt 给模型):短消息复述几乎无损;长的、有情感密度的原文一旦被转述就会塌陷,此时保留原文比复述更有价值。用户点开 Inbox 后 `read_at` 落库,下一轮自动切换到已读分支做完整 assistant 注入,状态机自然闭合。
+
+### 4-D. 折叠策略
+
+积压多条时不要全量注入:24h 内保留最近 2 条原文,更早的压成一句摘要(如"过去两天你提醒过用户 X 和 Y,均未回应")。
+
+### 4-E. 其他
+
+- 每次收到用户真实消息时更新 `last_user_message_at`
+- `consumed_at` 与 `surfaced_count` 的写入**只在请求成功完成后执行**,流式中断不写
+
+## 5. Inbox
+
+新增 `/inbox` 页面:
+
+- 按时间倒序展示 wake-up:`content` 全文、`decision_type`、`reason`、状态、时间
+- **鉴权必做**:URL 携带 `conv_inbox_tokens.token` 校验,响应头 `Cache-Control: no-store`。这是公网可读的对话内容端点,不允许裸奔
+- 打开时为该 conv 下所有未读 wake-up 回填 `read_at`,**幂等**:已有 `read_at` 不覆盖
+- 服务端渲染即可,不引入前端框架
+- 数据源与展示解耦,便于将来接其他客户端
+
+**token 为什么是 conv 级而非 per-message:** 需要在 AI 生成的自然语言里出现完整 URL。per-message token 会导致每次链接都不同,模型逐字复制长随机串时必然出现字符错漏。conv 级固定链接可复用、可进长期记忆、可被校验缓存。代价是该链接泄露即暴露该会话全部 wake-up —— 可接受,单用户自用场景。
+
+## 6. 安全检查
+
+- Gateway 8788 端口若公网可达,补 Bearer token 鉴权。**当前状态是任何人都能白用 API key 并读取对话历史**,优先级最高
+- token 用 `secrets.token_urlsafe(32)` 生成,禁止使用自增 id、时间戳或可预测值
+- Inbox 的 read 回传幂等,重复点击不改变已有 `read_at`
+- `/inbox` 渲染 `content` 时做 HTML 转义,防止 AI 生成内容注入页面
+
+## 交付要求
+
+- 优先保证现有 Heartbeat / Decision / ntfy 链路不回归
+- 数据库变更用可重复执行的迁移脚本(`CREATE TABLE IF NOT EXISTS` / 检查列是否存在再 `ALTER`)
+- 单元测试覆盖:
+  - 三种注入状态(已读 / 未读 48h 内 / 超期或 surfaced 到顶)
+  - 未读消息注入后 `consumed_at` **保持为空**
+  - `surfaced_count` 达到 2 后不再注入
+  - Inbox `read_at` 回填幂等
+  - `SKIP` 决策确实写入 `decision_logs`
+- 完成后说明哪些部分已验证、哪些未能验证及原因
+最容易被 agent 偷懒简化掉的四处,改完重点看:四态没被压成布尔值、未读不回填 consumed_at、surfaced_count 上限生效、SKIP 有日志。
