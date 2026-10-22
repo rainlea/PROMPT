@@ -1,0 +1,4 @@
+interface:
+  display_name: "招投标技术核验"
+  short_description: "逐条核对招投标原文页码并联网核验设备参数与技术方案可行性"
+  default_prompt: "使用 $audit-tender-bids 核对招投标参数与方案，列明双方原文页码、可靠来源和存疑点，不生成答辩问题。"
